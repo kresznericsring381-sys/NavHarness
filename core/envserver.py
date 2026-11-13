@@ -79,7 +79,9 @@ class ServerHandle:
                 self.proc.kill()
 
 
-def launch(env_block: dict[str, Any], port: int, log_path: Path) -> ServerHandle:
+def launch(
+    env_block: dict[str, Any], port: int, log_path: Path, *, extra_env: dict[str, str] | None = None
+) -> ServerHandle:
     """Start ``<env.python> -m core.envserver`` for this block on ``port`` and
     return at once; ``wait_healthy`` blocks until it answers."""
     python = resolve_python(env_block.get("python"))
@@ -91,7 +93,7 @@ def launch(env_block: dict[str, Any], port: int, log_path: Path) -> ServerHandle
         stdout=log,
         stderr=subprocess.STDOUT,
         preexec_fn=_set_pdeathsig,
-        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT), **(extra_env or {})},
     )
     return ServerHandle(proc, f"http://127.0.0.1:{port}", log_path)
 
@@ -209,11 +211,22 @@ def make_handler(env: Any) -> type[BaseHTTPRequestHandler]:
                 return
             n = int(self.headers.get("Content-Length") or 0)
             kwargs = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            started = time.monotonic()
+            sys.stdout.write(f"[envserver] {verb} start\n")
+            sys.stdout.flush()
             try:
                 self._send(200, method(**kwargs))
             except Exception as exc:
                 traceback.print_exc()
                 self._send(500, {"error": f"{verb}: {exc!r}"})
+                sys.stdout.write(
+                    f"[envserver] {verb} failed elapsed_s={time.monotonic() - started:.1f} "
+                    f"error={type(exc).__name__}: {exc}\n"
+                )
+                sys.stdout.flush()
+            else:
+                sys.stdout.write(f"[envserver] {verb} complete elapsed_s={time.monotonic() - started:.1f}\n")
+                sys.stdout.flush()
 
     return Handler
 

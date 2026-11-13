@@ -288,8 +288,8 @@ class NavHarnessAdapter:
 
         self._model_id = spec.model_id
         extra = spec.extra_dict
-        if extra.get("params"):
-            raise RuntimeError("navh takes no sampling params — the Agent SDK exposes none")
+        if extra.get("params") and self.transport != "mini-session":
+            raise RuntimeError("sampling params are supported only on the mini-session transport")
         judge_id = self.settings["judge_model"] or spec.model_id
         judge_transport = self.switches["judge_transport"] or self.transport
         if judge_transport != self.transport:
@@ -372,6 +372,8 @@ class NavHarnessAdapter:
             key = provider.prepare(model_id, extra).api_key
             if key:
                 kwargs["api_key"] = key
+        if isinstance(extra.get("params"), dict):
+            kwargs.update(extra["params"])
         return {"mini": kwargs} if kwargs else {}
 
     def finalize(self, run_dir: Path) -> dict[str, Any]:

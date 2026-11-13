@@ -171,6 +171,20 @@ def test_the_navh_seat_composes_and_builds(seat: str) -> None:
     assert app["run"]["dir"].endswith(f"/navharness/{app['run']['name']}")
 
 
+def test_preflight_mode_is_composed_and_qwen_output_cap_reaches_mini() -> None:
+    app = compose_app(
+        EXPERIMENT,
+        ["harness=navhmini", "model=qwen3.8-27b-bailian", "run.preflight=then_run"],
+    )
+    assert app["run"]["preflight"] == "then_run"
+    adapter, *_ = build(app)
+    adapter._gateway = None
+    endpoint = adapter._endpoint_for(
+        app["agent"]["model"]["id"], app["agent"]["model"], "mini-session", fake=False
+    )
+    assert endpoint["mini"]["max_tokens"] == 2048
+
+
 # ── the Codex line ──
 
 

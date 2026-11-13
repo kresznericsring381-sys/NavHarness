@@ -103,6 +103,7 @@ run:
   wp_server: null
   resume: false
   dry_run: false
+  preflight: off  # off | only | then_run: place episode and verify Habitat + SLAM before model setup
   budget_usd: null
   note: null
   retry: {max_attempts: 6, base_backoff_s: 30.0, max_backoff_s: 300.0}  # rate-limit re-runs (core.retry)

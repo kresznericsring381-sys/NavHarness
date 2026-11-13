@@ -4,14 +4,14 @@ Launched by _slam.OrbSlam3Client as:
     docker run -i --rm -v <this dir>:/work:ro navharness/orbslam3 \
         python3 /work/_slam_server.py
 
-Protocol (one JSON object per line on stdin; one JSON reply per line on a
-dup of the original stdout — the C++ library spams the process stdout, so we
-re-point fd 1 at stderr and keep a private fd for replies):
+Protocol (one request header per line on stdin, followed by the track payload
+when applicable; one JSON reply per line on a dup of the original stdout —
+the C++ library spams process stdout, so fd 1 is redirected to stderr):
 
   {"cmd": "init", "intr": {fx, fy, cx, cy, width, height, fps?}}
       -> {"ok": true}
-  {"cmd": "track", "rgb": <b64 u8 HxWx3>, "depth": <b64 f32 HxW>,
-   "h": int, "w": int, "t": float}
+  {"cmd": "track", "h": int, "w": int, "t": float,
+   "rgb_nbytes": int, "depth_nbytes": int}\n<rgb bytes><depth float32 bytes>
       -> {"ok": true, "pose": 4x4 list | null, "state": int, "ok_frames": int}
   {"cmd": "trajectory"}
       -> {"ok": true, "trajectory": [{"t": float, "matrix": 4x4}]}
@@ -21,10 +21,10 @@ re-point fd 1 at stderr and keep a private fd for replies):
 """
 from __future__ import annotations
 
-import base64
 import json
 import os
 import sys
+import time
 
 # Keep a private fd for protocol replies; route everything else (including
 # ORB-SLAM3's C++ prints) to stderr.
@@ -90,11 +90,23 @@ def reply(obj):
     _RESP.flush()
 
 
+def read_payload(stream, size):
+    data = bytearray(size)
+    view = memoryview(data)
+    offset = 0
+    while offset < size:
+        n = stream.readinto(view[offset:])
+        if not n:
+            raise EOFError(f"incomplete binary frame: received {offset} of {size} bytes")
+        offset += n
+    return data
+
+
 def main():
     system = None
     orbslam3 = None
     ok_frames = 0
-    for line in sys.stdin:
+    for line in sys.stdin.buffer:
         line = line.strip()
         if not line:
             continue
@@ -102,6 +114,8 @@ def main():
             msg = json.loads(line)
             cmd = msg["cmd"]
             if cmd == "init":
+                started = time.monotonic()
+                print("[slam] init_start: loading ORB vocabulary and initializing tracker", file=sys.stderr, flush=True)
                 import orbslam3 as _o
                 orbslam3 = _o
                 if system is not None:
@@ -111,13 +125,18 @@ def main():
                 system.set_use_viewer(False)
                 system.initialize()
                 ok_frames = 0
+                print(f"[slam] init_ok elapsed_s={time.monotonic() - started:.1f}", file=sys.stderr, flush=True)
                 reply({"ok": True})
             elif cmd == "track":
                 h, w = int(msg["h"]), int(msg["w"])
-                rgb = np.frombuffer(base64.b64decode(msg["rgb"]), dtype=np.uint8)
-                rgb = rgb.reshape(h, w, 3).copy()
-                depth = np.frombuffer(base64.b64decode(msg["depth"]), dtype=np.float32)
-                depth = depth.reshape(h, w).copy()
+                rgb_nbytes = int(msg["rgb_nbytes"])
+                depth_nbytes = int(msg["depth_nbytes"])
+                if h <= 0 or w <= 0 or rgb_nbytes != h * w * 3 or depth_nbytes != h * w * 4:
+                    raise ValueError("invalid RGB-D frame dimensions or payload lengths")
+                rgb = np.frombuffer(read_payload(sys.stdin.buffer, rgb_nbytes), dtype=np.uint8)
+                rgb = rgb.reshape(h, w, 3)
+                depth = np.frombuffer(read_payload(sys.stdin.buffer, depth_nbytes), dtype=np.float32)
+                depth = depth.reshape(h, w)
                 system.process_image_rgbd(rgb, depth, float(msg["t"]))
                 state = int(system.get_tracking_state())
                 pose = None

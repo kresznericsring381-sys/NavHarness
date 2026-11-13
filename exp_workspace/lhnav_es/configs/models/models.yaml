@@ -20,3 +20,18 @@ gpt-4o:
   navhmini: {id: gpt-4o}
 qwen3.8-27b:
   navhmini: {id: ollama_chat/qwen3.8-27b-q4-std}   # a local Ollama tag: qwen3.8:27b-q4_K_M with seed 42 (README, step 5)
+qwen3.5-omni-flash-bailian:
+  navhmini:
+    id: openai/qwen3.5-omni-flash-2026-03-15
+    api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+    params: {max_tokens: 2048}  # pinned multimodal pilot cap
+deepseek-v4.1-flash-bailian:
+  navhmini:
+    id: openai/deepseek-v4.1-flash
+    api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+    params: {max_tokens: 1024}  # bounded multimodal pilot cap
+qwen3.8-27b-bailian:
+  navhmini:
+    id: openai/qwen3.8-27b
+    api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+    params: {max_tokens: 2048}  # pilot cap: prevent runaway reasoning completions

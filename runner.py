@@ -502,6 +502,15 @@ class Runner:
         self.retry = retry
         # run.client_timeout_s: one env verb over HTTP (place / step / evaluate …)
         self.client_timeout_s = float(app["run"].get("client_timeout_s") or 600.0)
+        self.preflight = str(app["run"].get("preflight") or "off")
+        if self.preflight not in {"off", "only", "then_run"}:
+            raise ValueError("run.preflight must be one of: off, only, then_run")
+        if self.preflight != "off":
+            selected = parse_episodes(str(app["run"]["episodes"]))
+            workers = int(app["run"].get("workers") or 1)
+            servers = list(app["run"].get("servers") or [])
+            if len(selected) != 1 or workers != 1 or len(servers) > 1:
+                raise ValueError("run.preflight requires exactly one episode and one environment server")
         self.run_ctx: RunContext | None = None  # the run in progress
         # index -> {module, goal} of an episode in flight, from its placement on:
         # what timeout_record needs to score a sequence the backstop cut short
@@ -516,8 +525,14 @@ class Runner:
         env = env_client_factory(url, timeout_s=self.client_timeout_s)
         module = self.module_cls(env, cfg, self.arm)
 
+        print(f"[std] episode {index} placement started on {url}", flush=True)
         placement = await module.place(index)
         goal = placement.goal
+        print(
+            f"[std] episode {index} placed id={goal.episode_id} scene={goal.scene_id} "
+            f"subgoals={goal.n_goals} elapsed={time.monotonic() - started:.1f}s",
+            flush=True,
+        )
         self._inflight[index] = {"module": module, "goal": goal}
         if placement.caps:
             cfg = {**cfg, **placement.caps}  # per-episode caps (GOAT); run cfg untouched
@@ -702,8 +717,10 @@ class Runner:
         (``run.episodes``) are re-run and replace their records."""
         app, env_name = self.app, self.env_name
 
-        # May raise (bad auth, unpinnable serving context) — that is the point.
-        self.adapter.prepare(self.model)
+        # A preflight deliberately reaches environment readiness before any
+        # model/provider setup. then_run prepares the adapter after SLAM passes.
+        if self.preflight == "off":
+            self.adapter.prepare(self.model)
 
         # the env: attach to run.servers, or spawn run.workers servers from the
         # env block (own interpreter, env.python; ports env.port, env.port+1, …)
@@ -716,7 +733,11 @@ class Runner:
             base = int(app["env"].get("port") or 9200)
             # n=1: env_server.log; n>1: one log per port
             handles = [
-                env_server.launch(app["env"], base + i, run_dir / (f"env_server_{base + i}.log" if workers > 1 else "env_server.log"))
+                env_server.launch(
+                    app["env"], base + i,
+                    run_dir / (f"env_server_{base + i}.log" if workers > 1 else "env_server.log"),
+                    extra_env={"ORBSLAM3_LOG": str(run_dir / f"orbslam3_{base + i}.log")},
+                )
                 for i in range(workers)
             ]
             self._spawned.extend(handles)
@@ -835,10 +856,13 @@ class Runner:
         )
         # every server placed for the whole run (dataset / split / body / arm
         # switches) — what the shape's env family needs, nothing per benchmark
-        for url in servers:
-            await self.module_cls.setup_server(
-                env_client_factory(url, timeout_s=self.client_timeout_s), cfg
-            )
+        preflight_path = run_dir / "preflight.json"
+        if self.preflight != "off":
+            self._preflight_started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            preflight_path.write_text(json.dumps({
+                "status": "running", "stage": "configure", "episode_index": indices[0],
+                "started_at": self._preflight_started_at,
+            }, indent=2))
 
         queue: asyncio.Queue[int] = asyncio.Queue()
         for index in indices:
@@ -873,6 +897,81 @@ class Runner:
         async def flush_summary(summary: dict[str, Any] | None = None) -> None:
             async with write_lock:
                 summary_path.write_text(json.dumps(summary or build_summary(), indent=2))
+
+        async def finish_early() -> dict[str, Any]:
+            summary = build_summary()
+            callbacks.fire("on_run_end", run, summary)
+            if run.callback_errors:
+                run.run_stats["callback_errors"] = dict(run.callback_errors)
+            summary = build_summary()
+            await flush_summary(summary)
+            callbacks.fire("on_run_written", run, summary_path)
+            return summary
+
+        for url in servers:
+            print(f"[std] environment configure started on {url}", flush=True)
+            try:
+                await self.module_cls.setup_server(
+                    env_client_factory(url, timeout_s=self.client_timeout_s), cfg
+                )
+            except Exception as exc:
+                if self.preflight == "off":
+                    raise
+                result = {
+                    "status": "failed", "stage": "configure", "episode_index": indices[0],
+                    "started_at": self._preflight_started_at,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                preflight_path.write_text(json.dumps(result, indent=2))
+                run.summary_extra["preflight"] = result
+                await flush_summary()
+                await finish_early()
+                raise RuntimeError(f"environment preflight failed: {result['error']}") from exc
+            print(f"[std] environment configure complete on {url}", flush=True)
+
+        if self.preflight != "off":
+            index = indices[0]
+            preflight_path.write_text(json.dumps({
+                "status": "running", "stage": "placement_and_slam", "episode_index": index,
+                "started_at": self._preflight_started_at,
+            }, indent=2))
+            try:
+                result = await self.preflight_episode(servers[0], index)
+            except Exception as exc:
+                result = {
+                    "status": "failed", "stage": "placement_and_slam", "episode_index": index,
+                    "started_at": self._preflight_started_at,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                preflight_path.write_text(json.dumps(result, indent=2))
+                run.summary_extra["preflight"] = result
+                await flush_summary()
+                await finish_early()
+                raise RuntimeError(f"environment preflight failed: {result['error']}") from exc
+
+            preflight_path.write_text(json.dumps(result, indent=2))
+            run.summary_extra["preflight"] = result
+            print(
+                f"[std] preflight {result['status']}: episode={index} "
+                f"id={result.get('episode_id')} scene={result.get('scene_id')}",
+                flush=True,
+            )
+            await flush_summary()
+            if self.preflight == "only":
+                return await finish_early()
+            try:
+                self.adapter.prepare(self.model)
+            except Exception as exc:
+                result = {
+                    "status": "failed", "stage": "model_setup", "episode_index": index,
+                    "started_at": self._preflight_started_at,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                preflight_path.write_text(json.dumps(result, indent=2))
+                run.summary_extra["preflight"] = result
+                await flush_summary()
+                await finish_early()
+                raise
 
         async def worker(position: int, url: str) -> None:
             await asyncio.sleep(position * 2)  # stagger cold-server scene loads
@@ -985,6 +1084,25 @@ class Runner:
         print(json.dumps(final, indent=2))
         callbacks.fire("on_run_written", run, summary_path)
         return final
+
+    async def preflight_episode(self, url: str, index: int) -> dict[str, Any]:
+        """Place one task and let its environment initialize SLAM, without a model session."""
+        started = time.monotonic()
+        env = env_client_factory(url, timeout_s=self.client_timeout_s)
+        module = self.module_cls(env, self.cfg, self.arm)
+        placement = await module.place(index)
+        goal = placement.goal
+        return {
+            "status": "ready",
+            "stage": "placement_and_slam",
+            "episode_index": index,
+            "episode_id": goal.episode_id,
+            "scene_id": goal.scene_id,
+            "goal": goal.text,
+            "n_goals": goal.n_goals,
+            "caps": placement.caps,
+            "elapsed_s": round(time.monotonic() - started, 2),
+        }
 
 
 

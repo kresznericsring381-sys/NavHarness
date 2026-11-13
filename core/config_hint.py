@@ -133,6 +133,7 @@ class RunCfg:
     wp_server: Optional[str] = None  # noqa: UP045 — OmegaConf structured configs need typing.Optional
     resume: bool = False
     dry_run: bool = False
+    preflight: str = "off"  # off | only | then_run: place one episode and verify env/SLAM before any model call
     budget_usd: Optional[float] = None  # noqa: UP045  # run-level cost fuse (callbacks.CostLogger)
     note: Optional[str] = None  # noqa: UP045 — OmegaConf structured configs need typing.Optional
     retry: RetryCfg = field(default_factory=RetryCfg)  # rate-limit re-runs; absent = core.retry.DEFAULT_RETRY

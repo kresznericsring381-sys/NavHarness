@@ -28,15 +28,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git clone --recursive --depth 1 --branch v0.9.1 \
         https://github.com/stevenlovegrove/Pangolin /opt/src/Pangolin && \
     cmake -B /opt/src/Pangolin/build -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF /opt/src/Pangolin && \
+        -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_PANGOLIN_PYTHON=OFF \
+        /opt/src/Pangolin && \
     cmake --build /opt/src/Pangolin/build -j6 && \
     cmake --install /opt/src/Pangolin/build && ldconfig
 
 # ORB-SLAM3 (Hello Robot fork — carries the Ubuntu 22.04 build fixes)
 # pinned to a commit, fetched shallow
+# GCC 11 on Jammy ICEs while compiling Optimizer.cc at the upstream -O3 level.
 RUN mkdir -p /opt/src/ORB_SLAM3 && cd /opt/src/ORB_SLAM3 && git init -q && \
     git remote add origin https://github.com/hello-binit/ORB_SLAM3 && \
     git fetch -q --depth 1 origin 4071a3eb98b95de915017bf236b0bbab3eb658a3 && git checkout -q FETCH_HEAD && \
+    sed -i 's/ -O3/ -O2/g' CMakeLists.txt && \
     ./build.sh && \
     cd build && make install && \
     cd ../Thirdparty/Sophus/build && make install && ldconfig

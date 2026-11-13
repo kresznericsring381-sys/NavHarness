@@ -499,6 +499,19 @@ my-model:
 
 Then run with `model=my-model`.
 
+Alibaba Model Studio (DashScope) can serve a Qwen model through its OpenAI-compatible
+endpoint without a local Ollama deployment. Keep the key outside the repository and pass
+it only to the run process:
+
+```bash
+export DASHSCOPE_API_KEY="$(< /path/to/dashscope-key)"
+python runner.py std_goat_slam_es_lhnav harness=navhmini model=qwen3.8-27b-bailian run.episodes=0
+```
+
+`qwen3.8-27b-bailian` uses `openai/qwen3.8-27b` at the DashScope
+OpenAI-compatible endpoint. It is useful for functional validation, but it is not the
+same controlled local-Ollama configuration used for the reported Qwen comparison.
+
 ### Outputs
 
 Each run writes to `outputs/navharness/<run name>/`:

@@ -22,11 +22,11 @@ import time
 from typing import Any
 
 import litellm
+from openai import APIError as OpenAIAPIError
 from jinja2 import StrictUndefined, Template
 from minisweagent.exceptions import FormatError
 from minisweagent.models.litellm_model import LitellmModel, LitellmModelConfig
 from minisweagent.models.utils.anthropic_utils import _reorder_anthropic_thinking_blocks
-from minisweagent.models.utils.retry import retry
 
 from core.pricing import add_litellm_usage
 
@@ -57,6 +57,10 @@ class NavToolsModelConfig(LitellmModelConfig):
 
 
 class NavToolsModel(LitellmModel):
+    # Replaying an API request after a timeout can bill twice if the provider
+    # accepted it but the response was lost. Keep API failures one-shot.
+    abort_exceptions = [*LitellmModel.abort_exceptions, OpenAIAPIError]
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(config_class=NavToolsModelConfig, **kwargs)
         self.billing: dict[str, dict[str, int]] = {}  # per model id, summed per call (core.pricing)
@@ -79,7 +83,7 @@ class NavToolsModel(LitellmModel):
                 model=self.config.model_name,
                 messages=messages,
                 tools=self._litellm_tools,
-                **(self.config.model_kwargs | kwargs),
+                **self._completion_kwargs(kwargs),
             )
             add_litellm_usage(self.billing, self.config.model_name, getattr(resp, "usage", None))
             return resp
@@ -92,20 +96,24 @@ class NavToolsModel(LitellmModel):
         that asks a question and reads the reply (a completion check, the
         place question). ``query`` cannot serve it: it parses tool calls and
         refuses a reply without one, which is the only reply such a question
-        has. Otherwise the request goes out as every other call does — mini's
-        retry, the same message preparation, the same billing ledger — and
-        the assistant message comes back as the provider sent it
+        has. The request uses the same preparation and billing ledger as the
+        tool path, and the assistant message comes back as the provider sent it
         (``content``, and ``reasoning_content`` when there is one)."""
-        resp: Any = None
-        for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
-            with attempt:
-                resp = litellm.completion(
-                    model=self.config.model_name,
-                    messages=self._prepare_messages_for_api(messages),
-                    **self.config.model_kwargs,
-                )
+        resp = litellm.completion(
+            model=self.config.model_name,
+            messages=self._prepare_messages_for_api(messages),
+            **self._completion_kwargs(),
+        )
         add_litellm_usage(self.billing, self.config.model_name, getattr(resp, "usage", None))
         return resp.choices[0].message.model_dump()
+
+    def _completion_kwargs(self, call_kwargs: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Set a finite request timeout and disable ambiguous API replays.
+
+        Endpoint/model kwargs and per-call kwargs remain able to override these
+        defaults for controlled experiments.
+        """
+        return {"timeout": 300, "num_retries": 0} | self.config.model_kwargs | (call_kwargs or {})
 
     def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
         # mini's set_cache_control asserts single-part content, which breaks on

@@ -53,6 +53,8 @@ def check_provider(hop: Hop) -> None:
     ordinary end of a hop capped at ``chunk_turns``."""
     tail = " ".join(str(s.get("text") or "") for s in hop.story[-3:] if s.get("role") == "assistant")
     low = (hop.text + " " + tail + " " + (hop.error or "")).lower()
+    if hop.error:
+        raise ProviderUnavailable((hop.error or hop.text).strip()[:200] or "model request failed")
     if any(w in low for w in REFUSAL_WORDS):
         raise ProviderUnavailable((hop.text or hop.error or "").strip()[:200] or "provider refused")
 

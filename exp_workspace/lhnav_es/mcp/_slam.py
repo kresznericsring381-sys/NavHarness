@@ -2,18 +2,21 @@
 
 Spawns ``docker run -i navharness/orbslam3 python3 /work/_slam_server.py``
 with this directory mounted read-only at /work, and speaks the JSON-lines
-protocol over the container's stdin/stdout. The image is built from
-``docker/orbslam3/``; ORB-SLAM3 is CPU-only, no GPU flags needed.
+protocol plus binary RGB-D payloads over the container's stdin/stdout. The
+image is built from ``docker/orbslam3/``; ORB-SLAM3 is CPU-only, no GPU flags
+needed.
 """
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import json
 import os
 import select
 import subprocess
+import time
+import uuid
+from pathlib import Path
 
 import numpy as np
 
@@ -38,7 +41,57 @@ def _stderr_sink():
 # frame is milliseconds; loop closure and map merging can take seconds; nothing
 # legitimate takes minutes. Startup loads the vocabulary, so it gets its own.
 RPC_TIMEOUT_S = 180.0
-INIT_TIMEOUT_S = 900.0
+INIT_TIMEOUT_S = 180.0
+VOCAB_CONTAINER_PATH = "/opt/orbslam3/ORBvoc.txt"
+
+
+def _assert_no_active_slam(image: str) -> None:
+    out = subprocess.run(
+        ["docker", "ps", "--filter", f"ancestor={image}", "--format", "{{.ID}} {{.Names}}"],
+        check=True, capture_output=True, text=True, timeout=15,
+    ).stdout.strip()
+    if out:
+        raise SlamDied(f"refusing to start another ORB-SLAM3 container while one is active: {out[:300]}")
+
+
+def _vocabulary_path(image: str = "navharness/orbslam3:latest") -> Path:
+    """Copy the large text vocabulary out of Docker's overlay layer once.
+
+    ORB-SLAM3's loader performs many small reads. A host-cached bind mount
+    avoids repeating those reads through the image's overlay layer per run.
+    """
+    configured = os.environ.get("ORBSLAM3_VOCAB_PATH")
+    if configured:
+        path = Path(configured).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"ORBSLAM3_VOCAB_PATH does not exist: {path}")
+        return path
+
+    image_id = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+        check=True, capture_output=True, text=True, timeout=15,
+    ).stdout.strip().replace(":", "-")
+    cache = Path(os.environ.get("ORBSLAM3_CACHE_DIR", "/mnt/ssd/fy/.cache/navharness/orbslam3")) / image_id
+    target = cache / "ORBvoc.txt"
+    if target.is_file() and target.stat().st_size > 100_000_000:
+        return target
+
+    cache.mkdir(parents=True, exist_ok=True)
+    tmp = cache / f"ORBvoc.txt.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    container = f"navh-orbvoc-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        subprocess.run(["docker", "create", "--name", container, image],
+                       check=True, capture_output=True, text=True, timeout=30)
+        subprocess.run(["docker", "cp", f"{container}:{VOCAB_CONTAINER_PATH}", str(tmp)],
+                       check=True, capture_output=True, text=True, timeout=120)
+        if tmp.stat().st_size < 100_000_000:
+            raise RuntimeError(f"ORB-SLAM3 vocabulary copy is unexpectedly small: {tmp.stat().st_size} bytes")
+        tmp.replace(target)
+        return target
+    finally:
+        tmp.unlink(missing_ok=True)
+        with contextlib.suppress(Exception):
+            subprocess.run(["docker", "rm", "-f", container], capture_output=True, timeout=30)
 
 
 class SlamError(RuntimeError):
@@ -55,10 +108,14 @@ class SlamDied(RuntimeError):
 
 class OrbSlam3Client:
     def __init__(self, image: str = "navharness/orbslam3:latest") -> None:
+        _assert_no_active_slam(image)
+        vocab = _vocabulary_path(image)
+        self.container_name = f"navh-orbslam-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self._proc = subprocess.Popen(
             [
-                "docker", "run", "-i", "--rm",
+                "docker", "run", "-i", "--rm", "--name", self.container_name,
                 "-v", f"{_THIS_DIR}:/work:ro",
+                "-v", f"{vocab}:{VOCAB_CONTAINER_PATH}:ro",
                 image, "python3", "/work/_slam_server.py",
             ],
             stdin=subprocess.PIPE,
@@ -67,13 +124,15 @@ class OrbSlam3Client:
             # dies, what it said on the way out is the only evidence there is.
             # Set ORBSLAM3_LOG to keep the file somewhere else.
             stderr=_stderr_sink(),
-            text=True,
         )
 
-    def _rpc(self, msg: dict, timeout_s: float | None = None) -> dict:
+    def _rpc(self, msg: dict, timeout_s: float | None = None,
+             payload: tuple[memoryview, ...] = ()) -> dict:
         assert self._proc.stdin is not None and self._proc.stdout is not None
         try:
-            self._proc.stdin.write(json.dumps(msg) + "\n")
+            self._proc.stdin.write(json.dumps(msg).encode("utf-8") + b"\n")
+            for part in payload:
+                self._proc.stdin.write(part)
             self._proc.stdin.flush()
             # A container that stops ANSWERING is as dead as one that exits, and
             # far more expensive: a hung frame holds the scene until the env's
@@ -96,19 +155,32 @@ class OrbSlam3Client:
     def init(self, intrinsics: dict, fps: float = 10.0) -> None:
         intr = dict(intrinsics)
         intr["fps"] = fps
-        self._rpc({"cmd": "init", "intr": intr}, timeout_s=INIT_TIMEOUT_S)
+        started = time.monotonic()
+        print("[slam] ORB-SLAM3 init_start", flush=True)
+        try:
+            self._rpc({"cmd": "init", "intr": intr}, timeout_s=INIT_TIMEOUT_S)
+        except BaseException as exc:
+            print(f"[slam] ORB-SLAM3 init_failed after {time.monotonic() - started:.1f}s: {exc}", flush=True)
+            with contextlib.suppress(Exception):
+                self._proc.kill()
+            with contextlib.suppress(Exception):
+                subprocess.run(["docker", "rm", "-f", self.container_name],
+                               capture_output=True, timeout=30)
+            raise
+        print(f"[slam] ORB-SLAM3 init ready in {time.monotonic() - started:.1f}s", flush=True)
 
     def track(self, rgb: np.ndarray, depth_m: np.ndarray, t: float) -> dict:
         """Returns {"pose": 4x4 ndarray | None, "state": int, "ok_frames": int}."""
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
         depth = np.ascontiguousarray(depth_m, dtype=np.float32)
         h, w = depth.shape
+        if rgb.shape != (h, w, 3):
+            raise ValueError(f"RGB shape {rgb.shape} does not match depth shape {(h, w)}")
         resp = self._rpc({
             "cmd": "track",
-            "rgb": base64.b64encode(rgb.tobytes()).decode(),
-            "depth": base64.b64encode(depth.tobytes()).decode(),
             "h": h, "w": w, "t": float(t),
-        })
+            "rgb_nbytes": rgb.nbytes, "depth_nbytes": depth.nbytes,
+        }, payload=(memoryview(rgb).cast("B"), memoryview(depth).cast("B")))
         pose = resp["pose"]
         return {
             "pose": None if pose is None else np.asarray(pose, dtype=np.float64),
@@ -138,3 +210,6 @@ class OrbSlam3Client:
             self._proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             self._proc.kill()
+            with contextlib.suppress(Exception):
+                subprocess.run(["docker", "rm", "-f", self.container_name],
+                               capture_output=True, timeout=30)

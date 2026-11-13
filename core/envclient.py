@@ -24,7 +24,11 @@ class EnvClient:
 
     def call_sync(self, name: str, **kwargs: Any) -> dict[str, Any]:
         resp = requests.post(f"{self.url}/{name}", json=kwargs, timeout=self.timeout_s)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            detail = resp.text[:500]
+            raise requests.HTTPError(f"{exc}; response={detail}", response=resp) from exc
         return resp.json()
 
     async def call(self, name: str, **kwargs: Any) -> dict[str, Any]:

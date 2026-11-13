@@ -354,12 +354,33 @@ class SlamEsEnvManager:
         with self._lock:
             if self._line is not None:
                 log.warning("SlamEsEnvManager already initialized — skipping")
-                return self.get_episode_info()
+                return self._configuration_unlocked()
             self._gpu_id = int(gpu_id)
             self._slam_cfg = dict(slam or {})
             self.configure(line=line, split=split or None, instruments=instruments)
             self._ensure_built_unlocked()
-            return self.get_episode_info()
+            return self._configuration_unlocked()
+
+    def _configuration_unlocked(self) -> dict:
+        return {
+            "line": self._line,
+            "split": self._split,
+            "instruments": self._instruments,
+            "episodes": len(self._order),
+            "placed": self._placed,
+        }
+
+    def configuration(self) -> dict:
+        """Build/describe the selected dataset without resetting an episode.
+
+        Placement is a separate verb so callers can select the requested
+        episode before paying the one-time SLAM initialization cost.
+        """
+        with self._lock:
+            if self._line is None:
+                return {"error": "Environment not initialized"}
+            self._ensure_built_unlocked()
+            return self._configuration_unlocked()
 
     def configure(
         self, line: str | None = None, split: str | None = None, instruments: int | None = None
@@ -1589,7 +1610,7 @@ class LhNavEsEnv:
             return m.initialize(line=line, split=split, instruments=int(instruments), gpu_id=self._gpu_id,
                                 slam=self._slam)
         m.configure(line=line, split=split, instruments=int(instruments))
-        return m.get_episode_info()
+        return m.configuration()
 
     def info(self) -> dict:
         m = self._mgr

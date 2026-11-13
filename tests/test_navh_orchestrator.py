@@ -22,7 +22,7 @@ from core.harnesses.navh import prompts as P
 from core.harnesses.navh.config import HarnessConfig
 from core.harnesses.navh.env.types import Goal, TaskEnd
 from core.harnesses.navh.orchestrator import Orchestrator
-from core.harnesses.navh.orchestrator.close import ProviderUnavailable
+from core.harnesses.navh.orchestrator.close import ProviderUnavailable, check_provider
 from core.harnesses.navh.session import Hop, prompt_text
 from core.harnesses.navh.session.base import BaseSession
 
@@ -127,6 +127,11 @@ def _hop(text: str = "DONE", turns: int = 1, *tools: str) -> Hop:
     return Hop(text=text, num_turns=turns, subtype="success", session_id="sid",
                usage={"input_tokens": 100, "output_tokens": 10, "iterations": [{"input_tokens": 120}]},
                tool_uses=[{"id": f"t{i}", "name": t, "input": {}} for i, t in enumerate(tools)])
+
+
+def test_provider_api_error_aborts_instead_of_starting_another_hop() -> None:
+    with pytest.raises(ProviderUnavailable, match="timed out"):
+        check_provider(Hop(subtype="error", error="Timeout: request timed out after 300s"))
 
 
 def _frame(orch: Orchestrator, st: dict, kind: str) -> None:
